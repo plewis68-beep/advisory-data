@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -104,7 +104,7 @@ jobs:
               out, asof = {}, None
               try:
                   import yfinance as yf
-                  df = yf.download(list(syms), period="10d", interval="1d", progress=False, auto_adjust=False, threads=True)
+                  df = yf.download(list(syms), period="10d", interval="1d", progress=False, auto_adjust=False, threads=True, timeout=20)
                   close = df["Close"] if "Close" in df.columns.get_level_values(0) else df
                   if not hasattr(close, "columns"): close = close.to_frame(list(syms)[0])
                   last = {}
@@ -153,14 +153,18 @@ jobs:
           # ---------- FRED / Treasury ----------
           def fred(sid):
               try:
-                  txt = http(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}", tries=2, timeout=90).decode()
+                  if "fred" in DEAD: raise TimeoutError("FRED skipped after an earlier timeout")
+                  try:
+                      txt = http(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}", tries=1, timeout=20).decode()
+                  except Exception:
+                      DEAD.add("fred"); raise
                   rows = [r for r in csv.reader(io.StringIO(txt))][1:]
                   for d, v in reversed(rows):
                       if fnum(v) is not None: return {"v": round(float(v), 4), "d": d}
               except Exception as e:
                   if sid == "SOFR":
                       try:
-                          r = json.loads(http("https://markets.newyorkfed.org/api/rates/secured/sofr/last/1.json", tries=2))["refRates"][0]
+                          r = json.loads(http("https://markets.newyorkfed.org/api/rates/secured/sofr/last/1.json", tries=1, timeout=20))["refRates"][0]
                           return {"v": float(r["percentRate"]), "d": r["effectiveDate"]}
                       except Exception:
                           pass
@@ -173,7 +177,7 @@ jobs:
               for yr in (TODAY.year, TODAY.year - 1):
                   try:
                       url = f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{yr}/all?type=daily_treasury_yield_curve&field_tdr_date_value={yr}&page&_format=csv"
-                      rows = list(csv.DictReader(io.StringIO(http(url).decode("utf-8-sig"))))
+                      rows = list(csv.DictReader(io.StringIO(http(url, tries=2, timeout=30).decode("utf-8-sig"))))
                       if not rows: continue
                       rows.sort(key=lambda r: dt.datetime.strptime(r["Date"], "%m/%d/%Y"))
                       r = rows[-1]
