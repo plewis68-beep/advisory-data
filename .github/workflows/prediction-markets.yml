@@ -1,0 +1,207 @@
+name: Prediction markets snapshot
+
+on:
+  schedule:
+    - cron: "5 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build data
+        run: |
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Prediction-market snapshot for the Advisory Console -> data/predictions.json
+          Public, no-key APIs: Polymarket (gamma-api.polymarket.com) and Kalshi (api.elections.kalshi.com).
+          Columns: id, src, title, out, p, d1, d7, d30, vol, v24, end, url, th, tags.
+          Daily history (data/pm_hist/<date>.json) fills 7- and 30-day changes where a source doesn't give them."""
+          import json, os, re, sys, time, datetime as dt, urllib.request, urllib.parse
+
+          UA = {"User-Agent": "advisory-data-feed/1.0", "Accept": "application/json"}
+          NOW = dt.datetime.now(dt.timezone.utc)
+          TODAY = NOW.date()
+          MAX_ROWS = 6000
+          errors, counts = [], {}
+
+          def get(url, tries=3):
+              for i in range(tries):
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
+                          return json.loads(r.read())
+                  except Exception as e:
+                      if i == tries - 1: raise
+                      time.sleep(2 + 3 * i)
+
+          def f(x):
+              try:
+                  v = float(x); return v if v == v else None
+              except Exception:
+                  return None
+
+          def jl(x):
+              if isinstance(x, list): return x
+              try: return json.loads(x or "[]")
+              except Exception: return []
+
+          THEMES = [
+              ("rates", r"\bfed\b|fomc|interest rate|rate cut|rate hike|powell|treasury yield|10-year|basis points|\bbps\b|federal funds"),
+              ("inflation", r"inflation|\bcpi\b|\bpce\b|consumer price"),
+              ("growth", r"recession|\bgdp\b|unemployment|jobless|payroll|jobs report|nonfarm|economy"),
+              ("energy", r"\boil\b|crude|\bwti\b|brent|natural gas|gasoline|opec|\blng\b|electricity|power price"),
+              ("commodities", r"gold|silver|copper|wheat|corn|soybean|commodit"),
+              ("policy", r"tariff|congress|senate bill|supreme court|regulat|\bsec\b|antitrust|executive order|shutdown|debt ceiling|legislation|\bftc\b|\bdoj\b|tax"),
+              ("elections", r"election|primary|nominee|electoral|governor|mayor|poll|vote|ballot|presiden"),
+              ("geopolitics", r"war\b|ceasefire|ukraine|russia|china|taiwan|israel|iran|gaza|nato|sanction|invade|military|missile"),
+              ("tech_ai", r"\bai\b|openai|anthropic|nvidia|\bgpt|artificial intelligence|chip|semiconductor|apple|google|microsoft|tesla|spacex"),
+              ("crypto", r"bitcoin|\bbtc\b|ethereum|\beth\b|crypto|solana|stablecoin|\bxrp\b"),
+              ("markets", r"s&p|nasdaq|dow\b|stock market|\bipo\b|market cap|\bvix\b|shares|stock price"),
+              ("companies", r"acquire|acquisition|merger|takeover|\bceo\b|bankrupt|earnings|layoff"),
+              ("climate", r"hurricane|temperature|weather|climate|snow|rain|heat|storm|tornado|wildfire"),
+          ]
+          SKIP = r"\b(nfl|nba|mlb|nhl|ufc|soccer|premier league|champions league|tennis|golf|f1\b|formula 1|super bowl|world series|stanley cup|match|game \d|vs\.?|touchdown|esports|oscars|grammy|emmy|box office|album|song|spotify|tweet|youtube|mrbeast|taylor swift)\b"
+
+          def themes(text, tags=()):
+              s = (text + " " + " ".join(tags)).lower()
+              th = [k for k, rx in THEMES if re.search(rx, s)]
+              return th[:3] or ["other"]
+
+          def day(s):
+              return str(s)[:10] if s else None
+
+          # ---------------- Polymarket ----------------
+          def polymarket():
+              rows, off = [], 0
+              while off < 3000:
+                  q = urllib.parse.urlencode({"active": "true", "closed": "false", "archived": "false", "limit": 100, "offset": off, "order": "volume24hr", "ascending": "false"})
+                  evs = get(f"https://gamma-api.polymarket.com/events?{q}")
+                  if not evs: break
+                  for ev in evs:
+                      tags = [t.get("label") or t.get("slug") or "" for t in (ev.get("tags") or []) if isinstance(t, dict)]
+                      etitle = ev.get("title") or ""
+                      if re.search(SKIP, (etitle + " " + " ".join(tags)).lower()): continue
+                      mk = [m for m in (ev.get("markets") or []) if m.get("active", True) and not m.get("closed")]
+                      multi = len(mk) > 1
+                      for m in mk:
+                          outs, prices = jl(m.get("outcomes")), [f(x) for x in jl(m.get("outcomePrices"))]
+                          if not prices or prices[0] is None: continue
+                          if outs and len(outs) == 2 and str(outs[0]).lower() == "yes":
+                              p, out = prices[0], (m.get("groupItemTitle") or "") if multi else ""
+                          elif outs and len(outs) == 2:
+                              p, out = prices[0], str(outs[0])
+                          else:
+                              p, out = prices[0], m.get("groupItemTitle") or ""
+                          title = etitle if multi else (m.get("question") or etitle)
+                          rows.append({
+                              "id": "pm:" + str(m.get("id")), "src": "Polymarket", "title": title[:200], "out": (out or "")[:120], "p": round(p, 4),
+                              "d1": f(m.get("oneDayPriceChange")), "d7": f(m.get("oneWeekPriceChange")), "d30": f(m.get("oneMonthPriceChange")),
+                              "vol": f(m.get("volumeNum") or m.get("volume")), "v24": f(m.get("volume24hr")),
+                              "end": day(m.get("endDate") or ev.get("endDate")), "url": f"https://polymarket.com/event/{ev.get('slug')}",
+                              "th": themes(title + " " + (out or ""), tags), "tags": tags[:6]})
+                  off += 100
+                  time.sleep(0.3)
+              return rows
+
+          # ---------------- Kalshi ----------------
+          def cents(m, k):
+              v = f(m.get(k + "_dollars"))
+              if v is not None: return v
+              v = f(m.get(k))
+              return None if v is None else v / 100.0
+
+          def kalshi():
+              rows, cur, n = [], "", 0
+              while n < 40:
+                  q = {"status": "open", "with_nested_markets": "true", "limit": 200}
+                  if cur: q["cursor"] = cur
+                  J = get("https://api.elections.kalshi.com/trade-api/v2/events?" + urllib.parse.urlencode(q))
+                  for ev in J.get("events") or []:
+                      cat = ev.get("category") or ""
+                      etitle = ev.get("title") or ""
+                      if re.search(SKIP, (etitle + " " + cat).lower()) or cat.lower() in ("sports", "entertainment"): continue
+                      mk = [m for m in (ev.get("markets") or []) if (m.get("status") or "active") in ("active", "open")]
+                      multi = len(mk) > 1
+                      for m in mk:
+                          p = cents(m, "last_price")
+                          bid, ask = cents(m, "yes_bid"), cents(m, "yes_ask")
+                          if (p is None or p == 0) and bid is not None and ask is not None and ask > 0: p = (bid + ask) / 2
+                          if p is None: continue
+                          prev = cents(m, "previous_price")
+                          vol, v24 = f(m.get("volume_fp") or m.get("volume")), f(m.get("volume_24h_fp") or m.get("volume_24h"))
+                          if not vol and not v24: continue
+                          out = (m.get("yes_sub_title") or m.get("subtitle") or "") if multi else ""
+                          title = etitle if multi else (m.get("title") or etitle)
+                          st = (ev.get("series_ticker") or m.get("event_ticker") or "").lower()
+                          rows.append({
+                              "id": "ks:" + m.get("ticker", ""), "src": "Kalshi", "title": title[:200], "out": out[:120], "p": round(min(max(p, 0), 1), 4),
+                              "d1": round(p - prev, 4) if prev not in (None, 0) else None, "d7": None, "d30": None,
+                              "vol": vol, "v24": v24, "end": day(m.get("close_time") or m.get("expiration_time")),
+                              "url": f"https://kalshi.com/markets/{st}", "th": themes(title + " " + out + " " + cat, [cat]), "tags": [cat] if cat else []})
+                  cur = J.get("cursor") or ""; n += 1
+                  if not cur: break
+                  time.sleep(0.4)
+              return rows
+
+          def main():
+              rows = []
+              for name, fn in (("Polymarket", polymarket), ("Kalshi", kalshi)):
+                  try:
+                      r = fn(); rows += r; counts[name] = len(r); print(f"{name}: {len(r)} markets", flush=True)
+                  except Exception as e:
+                      errors.append(f"{name}: {type(e).__name__} {str(e)[:120]}"); counts[name] = 0
+              if not rows: sys.exit("no markets loaded: " + "; ".join(errors))
+              os.makedirs("data/pm_hist", exist_ok=True)
+              # 7/30-day changes from our own daily history when the source doesn't provide them
+              hist = {}
+              for back in (1, 7, 30):
+                  for slack in range(0, 4):
+                      fp = f"data/pm_hist/{(TODAY - dt.timedelta(days=back + slack)).isoformat()}.json"
+                      if os.path.exists(fp): hist[back] = json.load(open(fp)); break
+              for r in rows:
+                  for back, k in ((1, "d1"), (7, "d7"), (30, "d30")):
+                      if r[k] is None and back in hist and r["id"] in hist[back]: r[k] = round(r["p"] - hist[back][r["id"]], 4)
+              json.dump({r["id"]: r["p"] for r in rows}, open(f"data/pm_hist/{TODAY.isoformat()}.json", "w"), separators=(",", ":"))
+              for fn in os.listdir("data/pm_hist"):
+                  try:
+                      if (TODAY - dt.date.fromisoformat(fn[:10])).days > 40: os.remove(os.path.join("data/pm_hist", fn))
+                  except ValueError: pass
+              rows.sort(key=lambda r: -((r["v24"] or 0) * 3 + (r["vol"] or 0) / 30))
+              rows = rows[:MAX_ROWS]
+              cols = ["id", "src", "title", "out", "p", "d1", "d7", "d30", "vol", "v24", "end", "url", "th", "tags"]
+              for r in rows:
+                  for k in ("vol", "v24"):
+                      if r[k] is not None: r[k] = round(r[k])
+              J = {"asof": NOW.isoformat()[:19] + "Z", "cols": cols, "rows": [[r[c] for c in cols] for r in rows], "counts": counts, "errors": errors,
+                   "source": "Polymarket and Kalshi public APIs"}
+              json.dump(J, open("data/predictions.json", "w"), separators=(",", ":"))
+              print(f"wrote {len(rows)} markets; errors: {errors or 'none'}")
+
+          if __name__ == "__main__":
+              main()
+
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then echo "No changes"; exit 0; fi
+          git commit -m "Prediction markets snapshot: $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done
+          exit 1
