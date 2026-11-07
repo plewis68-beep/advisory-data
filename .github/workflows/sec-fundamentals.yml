@@ -1,0 +1,249 @@
+name: Nightly SEC fundamentals
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build data
+        env:
+          SEC_UA: ${{ secrets.SEC_UA }}
+        run: |
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Nightly SEC fundamentals feed for the Advisory Console -> data/fundamentals.json
+          TTM figures from SEC EDGAR XBRL companyfacts (10-K/10-Q/20-F/40-F) for NYSE, Nasdaq and NYSE American listings."""
+          import json, os, re, sys, math, datetime as dt, zipfile, urllib.request
+          UA = os.environ.get("SEC_UA") or "Advisory data feed (set the SEC_UA repository secret to: Firm name email)"
+          WORK = os.environ.get("EQ_WORK", "/tmp/eqwork"); os.makedirs(WORK, exist_ok=True)
+          TODAY = dt.date.today()
+          notes = []
+          def http(url, path=None, timeout=600):
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "identity"})
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  if path:
+                      with open(path, "wb") as f:
+                          while True:
+                              b = r.read(1 << 20)
+                              if not b: break
+                              f.write(b)
+                      return path
+                  return r.read()
+
+          D = lambda s: dt.date.fromisoformat(s)
+          FORMS = ("10-K", "10-Q", "10-K/A", "10-Q/A", "10-KT", "20-F", "40-F", "20-F/A", "40-F/A")
+
+          def facts_for(F, concepts, unit="USD"):
+              """Return (concept, entries) for the concept with the most recent data. entries: deduped list of dict(start,end,val,filed,form)."""
+              best = None
+              for c in concepts:
+                  tx, name = c.split(":") if ":" in c else ("us-gaap", c)
+                  u = F.get(tx, {}).get(name, {}).get("units", {})
+                  arr = u.get(unit) or (u.get("USD/shares") if unit == "USD/shares" else None) or []
+                  es = {}
+                  for e in arr:
+                      if e.get("form") not in FORMS or e.get("val") is None: continue
+                      k = (e.get("start"), e["end"])
+                      if k not in es or e.get("filed", "") > es[k].get("filed", ""): es[k] = e
+                  if not es: continue
+                  latest = max(e["end"] for e in es.values())
+                  if best is None or latest > best[2]: best = (c, list(es.values()), latest)
+              return (best[0], best[1]) if best else (None, [])
+
+          def dur(e): return (D(e["end"]) - D(e["start"])).days if e.get("start") else 0
+
+          def ttm_at(es, E):
+              """TTM value for a duration concept at end date E (str)."""
+              by = {}
+              for e in es:
+                  if e.get("start"): by.setdefault(e["end"], []).append(e)
+              at = by.get(E, [])
+              ann = [e for e in at if 350 <= dur(e) <= 380]
+              if ann: return ann[0]["val"]
+              ytd = sorted([e for e in at if 80 <= dur(e) < 350], key=dur, reverse=True)
+              for cur in ytd:
+                  dcur = dur(cur); Ed = D(E)
+                  prior = [e for e in es if e.get("start") and abs((Ed - D(e["end"])).days - 365) <= 12 and abs(dur(e) - dcur) <= 12]
+                  fyend = Ed - dt.timedelta(days=dcur)
+                  annual = [e for e in es if e.get("start") and 350 <= dur(e) <= 380 and abs((D(e["end"]) - fyend).days) <= 12]
+                  if prior and annual: return annual[0]["val"] + cur["val"] - prior[0]["val"]
+              # four quarters
+              qs = sorted([e for e in es if e.get("start") and 80 <= dur(e) <= 100 and 0 <= (D(E) - D(e["end"])).days <= 300], key=lambda e: e["end"], reverse=True)
+              picked, last = [], None
+              for q in qs:
+                  if last is None or (D(last) - D(q["end"])).days >= 80: picked.append(q); last = q["end"]
+                  if len(picked) == 4: break
+              if len(picked) == 4 and picked[0]["end"] == E: return sum(q["val"] for q in picked)
+              return None
+
+          def ttm(es, max_age_days=550):
+              ends = sorted({e["end"] for e in es if e.get("start") and 80 <= dur(e) <= 380}, reverse=True)
+              for E in ends[:3]:
+                  if (TODAY - D(E)).days > max_age_days: break
+                  v = ttm_at(es, E)
+                  if v is not None: return v, E
+              return None, None
+
+          def annuals(es):
+              a = {}
+              for e in es:
+                  if e.get("start") and 350 <= dur(e) <= 380:
+                      if e["end"] not in a or e.get("filed", "") > a[e["end"]].get("filed", ""): a[e["end"]] = e
+              return [(k, a[k]["val"]) for k in sorted(a, reverse=True)]
+
+          def instant(F, concepts, ref=None, unit="USD", tol=200):
+              best = None
+              for c in concepts:
+                  tx, name = c.split(":") if ":" in c else ("us-gaap", c)
+                  arr = F.get(tx, {}).get(name, {}).get("units", {}).get(unit, [])
+                  for e in arr:
+                      if e.get("start") or e.get("form") not in FORMS or e.get("val") is None: continue
+                      if best is None or e["end"] > best["end"] or (e["end"] == best["end"] and e.get("filed", "") > best.get("filed", "")): best = dict(e, _c=c)
+                  if best and ref and abs((D(ref) - D(best["end"])).days) <= 5: break
+              if best and ref and abs((D(ref) - D(best["end"])).days) > tol: return None, None
+              return (best["val"], best["end"]) if best else (None, None)
+
+          REV = ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet", "SalesRevenueGoodsNet", "RevenuesNetOfInterestExpense", "RegulatedAndUnregulatedOperatingRevenue", "ifrs-full:Revenue"]
+          COGS = ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold", "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization", "ifrs-full:CostOfSales"]
+          GP = ["GrossProfit", "ifrs-full:GrossProfit"]
+          OPI = ["OperatingIncomeLoss", "ifrs-full:ProfitLossFromOperatingActivities"]
+          DA = ["DepreciationDepletionAndAmortization", "DepreciationAmortizationAndAccretionNet", "DepreciationAndAmortization", "DepreciationAmortizationAndOther", "ifrs-full:DepreciationAndAmortisationExpense", "ifrs-full:DepreciationAmortisationAndImpairmentLossReversalOfImpairmentLossRecognisedInProfitOrLoss"]
+          NI = ["NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic", "ProfitLoss", "ifrs-full:ProfitLossAttributableToOwnersOfParent", "ifrs-full:ProfitLoss"]
+          CFO = ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations", "ifrs-full:CashFlowsFromUsedInOperatingActivities"]
+          CAPEX = ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets", "PaymentsForCapitalImprovements", "PaymentsToAcquireOilAndGasPropertyAndEquipment", "PaymentsToAcquireOilAndGasProperty", "ifrs-full:PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"]
+          DIV = ["PaymentsOfDividendsCommonStock", "PaymentsOfDividends", "ifrs-full:DividendsPaidClassifiedAsFinancingActivities"]
+          INT = ["InterestExpense", "InterestExpenseNonoperating", "InterestExpenseDebt", "InterestAndDebtExpense", "ifrs-full:InterestExpense"]
+          SBC = ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"]
+          CASH = ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "Cash", "ifrs-full:CashAndCashEquivalents"]
+          STI = ["ShortTermInvestments", "MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"]
+          DEBT_TOT = ["LongTermDebt", "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities", "DebtAndCapitalLeaseObligations", "DebtLongtermAndShorttermCombinedAmount"]
+          DEBT_NC = ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations", "LongTermNotesPayable", "SeniorLongTermNotes", "ifrs-full:NoncurrentPortionOfNoncurrentBorrowings", "ifrs-full:LongtermBorrowings"]
+          DEBT_C = ["DebtCurrent", "LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent", "ifrs-full:CurrentPortionOfLongtermBorrowings", "ifrs-full:ShorttermBorrowings"]
+          STB = ["ShortTermBorrowings", "CommercialPaper"]
+          EQ = ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", "ifrs-full:EquityAttributableToOwnersOfParent", "ifrs-full:Equity"]
+          NCI = ["MinorityInterest", "ifrs-full:NoncontrollingInterests"]
+          PREF = ["PreferredStockValue"]
+          ASSETS = ["Assets", "ifrs-full:Assets"]
+
+          FD_COLS = ["t", "cik", "rev", "revP", "rev3", "gp", "ebit", "da", "ebitda", "ni", "cfo", "capex", "div", "int", "sbc", "cash", "debt", "eq", "nci", "pref", "assets", "per", "bs", "form", "filed", "cur"]
+
+          def fundamentals(F, cur="USD"):
+              r = {}
+              def T(cs):
+                  c, es = facts_for(F, cs, cur)
+                  return ttm(es) if es else (None, None)
+              c, rev_es = facts_for(F, REV, cur)
+              r["rev"], per = ttm(rev_es) if rev_es else (None, None)
+              if per:
+                  Ep = None
+                  for e in rev_es:
+                      if e.get("start") and abs((D(per) - D(e["end"])).days - 365) <= 12: Ep = e["end"]; break
+                  r["revP"] = ttm_at(rev_es, Ep) if Ep else None
+                  A = annuals(rev_es)
+                  r["rev3"] = None
+                  if len(A) >= 4 and A[3][1] and A[0][1] and A[3][1] > 0 and A[0][1] > 0 and abs((D(A[0][0]) - D(A[3][0])).days - 1095) < 20:
+                      r["rev3"] = (A[0][1] / A[3][1]) ** (1 / 3) - 1
+              gp, _ = T(GP)
+              if gp is None and r.get("rev") is not None:
+                  cg, _ = T(COGS); gp = r["rev"] - cg if cg is not None else None
+              r["gp"] = gp
+              r["ebit"], _ = T(OPI); r["da"], _ = T(DA)
+              r["ebitda"] = r["ebit"] + r["da"] if r["ebit"] is not None and r["da"] is not None else None
+              r["ni"], p2 = T(NI); per = per or p2
+              r["cfo"], _ = T(CFO); r["capex"], _ = T(CAPEX); r["div"], _ = T(DIV); r["int"], _ = T(INT); r["sbc"], _ = T(SBC)
+              cash, bs = instant(F, CASH, None, cur)
+              r["cash"] = (cash or 0) + (instant(F, STI, bs, cur, 5)[0] or 0) if cash is not None else None
+              tot = instant(F, DEBT_TOT, bs, cur, 5)[0]
+              if tot is None:
+                  nc = instant(F, DEBT_NC, bs, cur, 5)[0]; cu = instant(F, DEBT_C, bs, cur, 5)[0]
+                  tot = (nc or 0) + (cu or 0) if (nc is not None or cu is not None) else None
+                  if tot is not None and instant(F, ["DebtCurrent"], bs, cur, 5)[0] is None: tot += instant(F, STB, bs, cur, 5)[0] or 0
+              else:
+                  tot += instant(F, STB, bs, cur, 5)[0] or 0
+              r["debt"] = tot if tot is not None else (0 if bs else None)
+              r["eq"] = instant(F, EQ, bs, cur, 5)[0]; r["nci"] = instant(F, NCI, bs, cur, 5)[0]; r["pref"] = instant(F, PREF, bs, cur, 5)[0]; r["assets"] = instant(F, ASSETS, bs, cur, 5)[0]
+              r["per"], r["bs"] = per, bs
+              return r
+
+
+          def run_fundamentals(tickers):
+              m = json.loads(http("https://www.sec.gov/files/company_tickers_exchange.json", timeout=60))
+              idx = {row[2]: row[0] for row in m["data"]}  # ticker -> cik
+              want = {}
+              for t in tickers:
+                  k = idx.get(t) or idx.get(t.replace("/", "-")) or idx.get(t.replace(".", "-")) or idx.get(t.replace("-", "."))
+                  if k: want.setdefault(int(k), []).append(t)
+              zp = os.path.join(WORK, "companyfacts.zip")
+              if not os.path.exists(zp) or (dt.datetime.now().timestamp() - os.path.getmtime(zp)) > 20 * 3600:
+                  http("https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip", zp, timeout=3000)
+              out = []
+              with zipfile.ZipFile(zp) as z:
+                  for name in z.namelist():
+                      mm = re.match(r"CIK(\d+)\.json", os.path.basename(name))
+                      if not mm or int(mm.group(1)) not in want: continue
+                      try:
+                          J = json.loads(z.read(name)); F = J.get("facts", {})
+                          # reporting currency: USD unless the revenue/assets facts are only in another currency
+                          cur = "USD"
+                          for c in ("us-gaap", "ifrs-full"):
+                              for nm in ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "Revenue", "Assets"):
+                                  u = F.get(c, {}).get(nm, {}).get("units", {})
+                                  if u and "USD" not in u: cur = next(iter(u))
+                          r = fundamentals(F, cur)
+                          last = None
+                          for c in F.values():
+                              for v in c.values():
+                                  for u in v.get("units", {}).values():
+                                      for e in u[-3:]:
+                                          if e.get("form") in FORMS and (last is None or e.get("filed", "") > last[1]): last = (e["form"], e.get("filed", ""))
+                          for t in want[int(mm.group(1))]:
+                              out.append([t, int(mm.group(1)), *[None if r.get(k) is None else (round(r[k], 4) if k == "rev3" else round(r[k])) for k in FD_COLS[2:21]], r.get("per"), r.get("bs"), (last or ("", ""))[0], (last or ("", ""))[1], cur])
+                      except Exception as e:
+                          notes.append(f"{name}: {type(e).__name__} {str(e)[:80]}")
+              return out
+
+
+          def main():
+              m = json.loads(http("https://www.sec.gov/files/company_tickers_exchange.json", timeout=60))
+              tickers = sorted({row[2] for row in m["data"] if row[2] and str(row[3] or "").upper() in ("NYSE", "NASDAQ", "CBOE", "NYSE AMERICAN", "NYSE ARCA", "NYSEAMERICAN")})
+              print(f"{len(tickers)} listed tickers", flush=True)
+              rows = run_fundamentals(tickers)
+              os.makedirs("data", exist_ok=True)
+              J = {"asof": TODAY.isoformat(), "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat()[:19] + "Z", "cols": FD_COLS, "rows": rows,
+                   "source": "SEC EDGAR XBRL companyfacts; TTM = last fiscal year + current YTD - prior-year YTD", "notes": notes[:50]}
+              if len(rows) < 500: sys.exit(f"only {len(rows)} companies parsed - keeping the previous feed")
+              json.dump(J, open("data/fundamentals.json", "w"), separators=(",", ":"))
+              print(f"wrote {len(rows)} companies; {len(notes)} parse notes")
+
+          if __name__ == "__main__":
+              main()
+
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then echo "No changes"; exit 0; fi
+          git commit -m "Nightly SEC fundamentals: $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done
+          exit 1
