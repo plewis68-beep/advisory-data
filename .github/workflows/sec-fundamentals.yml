@@ -32,7 +32,7 @@ jobs:
           """Nightly SEC fundamentals feed for the Advisory Console -> data/fundamentals.json
           TTM figures from SEC EDGAR XBRL companyfacts (10-K/10-Q/20-F/40-F) for NYSE, Nasdaq and NYSE American listings."""
           import json, os, re, sys, math, datetime as dt, zipfile, urllib.request
-          UA = os.environ.get("SEC_UA") or "Advisory data feed (set the SEC_UA repository secret to: Firm name email)"
+          UA = " ".join((os.environ.get("SEC_UA") or "").split()).strip("\"' ") or "Advisory data feed (set the SEC_UA repository secret to: Firm name email)"
           WORK = os.environ.get("EQ_WORK", "/tmp/eqwork"); os.makedirs(WORK, exist_ok=True)
           TODAY = dt.date.today()
           notes = []
@@ -235,7 +235,6 @@ jobs:
 
           if __name__ == "__main__":
               main()
-
           PY
 
       - name: Commit and push
