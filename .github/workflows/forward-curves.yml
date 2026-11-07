@@ -24,6 +24,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install yfinance
+        run: pip install -q yfinance
+
       - name: Build data
         run: |
           python3 - <<'PY'
@@ -96,10 +99,28 @@ jobs:
           YSUF = {"CL": "NYM", "BZ": "NYM", "NG": "NYM", "SR3": "CME", "ZQ": "CBT"}
 
           def yahoo(code, ym_list):
-              out, asof, miss = {}, None, 0
+              """Last close per contract via the yfinance library (handles Yahoo's cookie/crumb checks); urllib as a fallback."""
+              syms = {f"{code}{MC[m - 1]}{str(y)[2:]}.{YSUF[code]}": (y, m) for y, m in ym_list}
+              out, asof = {}, None
+              try:
+                  import yfinance as yf
+                  df = yf.download(list(syms), period="10d", interval="1d", progress=False, auto_adjust=False, threads=True)
+                  close = df["Close"] if "Close" in df.columns.get_level_values(0) else df
+                  if not hasattr(close, "columns"): close = close.to_frame(list(syms)[0])
+                  last = {}
+                  for sym in close.columns:
+                      col = close[sym].dropna()
+                      if len(col) and sym in syms:
+                          out[syms[sym]] = float(col.iloc[-1]); last[syms[sym]] = col.index[-1].date()
+                  if out:
+                      newest = max(last.values()); asof = newest.isoformat()
+                      out = {k: v for k, v in out.items() if (newest - last[k]).days <= 4}  # drop expired contracts with stale prices
+                      return out, asof
+              except Exception as e:
+                  errors.append(f"yfinance {code}: {type(e).__name__} {str(e)[:60]}")
               if "yahoo" in DEAD: return out, asof
-              for y, m in ym_list:
-                  sym = f"{code}{MC[m - 1]}{str(y)[2:]}.{YSUF[code]}"
+              miss = 0
+              for sym, (y, m) in syms.items():
                   try:
                       J = json.loads(http(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5d&interval=1d", tries=1, timeout=15))
                       r = J["chart"]["result"][0]; meta = r["meta"]
@@ -132,11 +153,17 @@ jobs:
           # ---------- FRED / Treasury ----------
           def fred(sid):
               try:
-                  txt = http(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}").decode()
+                  txt = http(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}", tries=2, timeout=90).decode()
                   rows = [r for r in csv.reader(io.StringIO(txt))][1:]
                   for d, v in reversed(rows):
                       if fnum(v) is not None: return {"v": round(float(v), 4), "d": d}
               except Exception as e:
+                  if sid == "SOFR":
+                      try:
+                          r = json.loads(http("https://markets.newyorkfed.org/api/rates/secured/sofr/last/1.json", tries=2))["refRates"][0]
+                          return {"v": float(r["percentRate"]), "d": r["effectiveDate"]}
+                      except Exception:
+                          pass
                   errors.append(f"FRED {sid}: {type(e).__name__}")
               return None
 
