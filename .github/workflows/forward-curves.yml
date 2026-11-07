@@ -1,0 +1,247 @@
+name: Forward curves
+
+on:
+  schedule:
+    - cron: "40 23 * * 1-5"
+    - cron: "40 11 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build data
+        run: |
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Forward curves for the Advisory Console -> data/curves.json
+          Futures settlements: CME Group public settlements (fallback: Yahoo Finance contract quotes) for WTI (CL), Brent (BZ),
+          Henry Hub (NG), 3-month SOFR (SR3) and 30-day Fed funds (ZQ). Spot: FRED. Treasury par curve: U.S. Treasury.
+          Keeps a small daily history (data/curves_hist/) for 1-week and 1-month changes."""
+          import json, os, re, sys, time, math, csv, io, datetime as dt, urllib.request
+
+          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept": "application/json,text/csv,*/*"}
+          TODAY = dt.date.today()
+          MC = "FGHJKMNQUVXZ"
+          MON = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+          errors = []
+
+          def http(url, tries=3, timeout=45):
+              for i in range(tries):
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+                          return r.read()
+                  except Exception:
+                      if i == tries - 1: raise
+                      time.sleep(2 + 2 * i)
+
+          def fnum(x):
+              try:
+                  v = float(str(x).replace(",", "").replace("'", "").strip().rstrip("ABab"))
+                  return v if math.isfinite(v) else None
+              except Exception:
+                  return None
+
+          def months_ahead(n, start=None):
+              d = start or TODAY.replace(day=1)
+              out = []
+              for i in range(n):
+                  y, m = d.year + (d.month - 1 + i) // 12, (d.month - 1 + i) % 12 + 1
+                  out.append((y, m))
+              return out
+
+          # ---------- CME settlements ----------
+          CME_ID = {"CL": 425, "BZ": 424, "NG": 444, "SR3": 8462, "ZQ": 305}
+
+          def cme(code):
+              """{(year, month): settle} from the latest trade date CME publishes."""
+              for back in range(0, 7):
+                  d = TODAY - dt.timedelta(days=back)
+                  if d.weekday() >= 5: continue
+                  url = f"https://www.cmegroup.com/CmeWS/mvc/Settlements/Futures/Settlements/{CME_ID[code]}/FUT?strategy=DEFAULT&tradeDate={d.strftime('%m/%d/%Y')}&pageSize=500&isProtected"
+                  try:
+                      J = json.loads(http(url, tries=2))
+                  except Exception as e:
+                      last = e; continue
+                  out = {}
+                  for s in J.get("settlements") or []:
+                      mm = re.match(r"([A-Z]{3})\s+(\d{2})", s.get("month") or "")
+                      v = fnum(s.get("settle"))
+                      if not mm or v is None or mm.group(1) not in MON: continue
+                      out[(2000 + int(mm.group(2)), MON.index(mm.group(1)) + 1)] = v
+                  if len(out) >= 3: return out, d.isoformat()
+              return {}, None
+
+          # ---------- Yahoo fallback ----------
+          YSUF = {"CL": "NYM", "BZ": "NYM", "NG": "NYM", "SR3": "CME", "ZQ": "CBT"}
+
+          def yahoo(code, ym_list):
+              out, asof, miss = {}, None, 0
+              for y, m in ym_list:
+                  sym = f"{code}{MC[m - 1]}{str(y)[2:]}.{YSUF[code]}"
+                  try:
+                      J = json.loads(http(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5d&interval=1d", tries=2))
+                      r = J["chart"]["result"][0]; meta = r["meta"]
+                      closes = [c for c in (r.get("indicators", {}).get("quote", [{}])[0].get("close") or []) if c]
+                      v = closes[-1] if closes else meta.get("regularMarketPrice")
+                      if v:
+                          out[(y, m)] = float(v); miss = 0
+                          ts = (r.get("timestamp") or [meta.get("regularMarketTime")])[-1]
+                          if ts: asof = max(asof or "", dt.datetime.utcfromtimestamp(ts).date().isoformat())
+                      else: miss += 1
+                  except Exception:
+                      miss += 1
+                  if miss >= 6 and out: break
+                  time.sleep(0.15)
+              return out, asof
+
+          def strip(code, n, quarterly=False):
+              ym = [(y, m) for y, m in months_ahead(n) if not quarterly or m in (3, 6, 9, 12)]
+              data, asof = cme(code)
+              src = "CME Group settlements"
+              if len(data) < 3:
+                  data, asof = yahoo(code, ym)
+                  src = "CME futures via Yahoo Finance (last price)"
+              data = {k: v for k, v in data.items() if (k[0], k[1]) >= (TODAY.year, TODAY.month)}
+              if quarterly: data = {k: v for k, v in data.items() if k[1] in (3, 6, 9, 12)}
+              return dict(sorted(data.items())[:n]), asof, src
+
+          # ---------- FRED / Treasury ----------
+          def fred(sid):
+              try:
+                  txt = http(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}").decode()
+                  rows = [r for r in csv.reader(io.StringIO(txt))][1:]
+                  for d, v in reversed(rows):
+                      if fnum(v) is not None: return {"v": round(float(v), 4), "d": d}
+              except Exception as e:
+                  errors.append(f"FRED {sid}: {type(e).__name__}")
+              return None
+
+          TEN = [("1 Mo", 1 / 12), ("2 Mo", 2 / 12), ("3 Mo", .25), ("4 Mo", 1 / 3), ("6 Mo", .5), ("1 Yr", 1), ("2 Yr", 2), ("3 Yr", 3), ("5 Yr", 5), ("7 Yr", 7), ("10 Yr", 10), ("20 Yr", 20), ("30 Yr", 30)]
+
+          def treasury():
+              for yr in (TODAY.year, TODAY.year - 1):
+                  try:
+                      url = f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{yr}/all?type=daily_treasury_yield_curve&field_tdr_date_value={yr}&page&_format=csv"
+                      rows = list(csv.DictReader(io.StringIO(http(url).decode("utf-8-sig"))))
+                      if not rows: continue
+                      rows.sort(key=lambda r: dt.datetime.strptime(r["Date"], "%m/%d/%Y"))
+                      r = rows[-1]
+                      par = [{"t": t.replace("Mo", "mo").replace("Yr", "yr"), "y": fnum(r[t]), "n": n} for t, n in TEN if fnum(r.get(t)) is not None]
+                      return dt.datetime.strptime(r["Date"], "%m/%d/%Y").date().isoformat(), par
+                  except Exception as e:
+                      err = e
+              errors.append(f"Treasury curve: {type(err).__name__}")
+              return None, []
+
+          def ust_forwards(par):
+              """Bootstrap annual-coupon par yields to zero rates, then 1-year forwards for years 1..10."""
+              if len(par) < 4: return []
+              xs, ys = [p["n"] for p in par], [p["y"] / 100 for p in par]
+              def interp(t):
+                  if t <= xs[0]: return ys[0]
+                  for i in range(1, len(xs)):
+                      if t <= xs[i]: return ys[i - 1] + (ys[i] - ys[i - 1]) * (t - xs[i - 1]) / (xs[i] - xs[i - 1])
+                  return ys[-1]
+              dfs = []
+              for n in range(1, 11):
+                  c = interp(n)
+                  df = (1 - c * sum(dfs)) / (1 + c)
+                  dfs.append(df)
+              fw, prev = [], 1.0
+              for n, df in enumerate(dfs, 1):
+                  fw.append({"y": n, "f": round((prev / df - 1) * 100, 3)}); prev = df
+              return fw
+
+          def main():
+              os.makedirs("data/curves_hist", exist_ok=True)
+              series, asofs = {}, []
+              for k, code, n, label, unit in (("wti", "CL", 84, "WTI crude (NYMEX CL)", "$/bbl"), ("brent", "BZ", 60, "Brent crude (NYMEX BZ)", "$/bbl"), ("hh", "NG", 84, "Henry Hub natural gas (NYMEX NG)", "$/MMBtu")):
+                  try:
+                      d, asof, src = strip(code, n)
+                      if len(d) < 3: raise RuntimeError("no contracts found")
+                      pts = [{"m": f"{y}-{m:02d}", "p": round(v, 3), "t": f"{code}{MC[m - 1]}{str(y)[2:]}"} for (y, m), v in d.items()]
+                      series[k] = {"label": label, "unit": unit, "src": src, "points": pts, "m12": round(sum(p["p"] for p in pts[:12]) / min(12, len(pts)), 3)}
+                      if asof: asofs.append(asof)
+                  except Exception as e:
+                      errors.append(f"{label}: {type(e).__name__} {str(e)[:80]}")
+              try:
+                  d, asof, src = strip("SR3", 66, quarterly=True)
+                  if d:
+                      series["sofr"] = {"label": "3-month SOFR futures (CME SR3)", "unit": "%", "src": src,
+                                        "points": [{"t": f"SR3{MC[m - 1]}{str(y)[2:]}", "m": f"{y}-{m:02d}", "p": round(100 - v, 4)} for (y, m), v in d.items()]}
+                      if asof: asofs.append(asof)
+              except Exception as e:
+                  errors.append(f"SOFR futures: {type(e).__name__}")
+              try:
+                  d, asof, src = strip("ZQ", 13)
+                  if d: series["ff"] = {"label": "30-day Fed funds futures (CBOT ZQ)", "unit": "%", "src": src, "points": [{"m": f"{y}-{m:02d}", "p": round(100 - v, 4)} for (y, m), v in d.items()]}
+              except Exception as e:
+                  errors.append(f"Fed funds futures: {type(e).__name__}")
+
+              ud, par = treasury()
+              fwd = ust_forwards(par)
+              spot = {k: v for k, v in (("wti", fred("DCOILWTICO")), ("brent", fred("DCOILBRENTEU")), ("hh", fred("DHHNGSP")), ("sofr", fred("SOFR"))) if v}
+
+              # SOFR path by calendar year: futures where available, then Treasury forwards less the average futures-vs-Treasury basis
+              path = {}
+              if "sofr" in series:
+                  by = {}
+                  for p in series["sofr"]["points"]: by.setdefault(int(p["m"][:4]), []).append(p["p"])
+                  path = {y: sum(v) / len(v) for y, v in by.items()}
+              if fwd and ud:
+                  t0 = dt.date.fromisoformat(ud)
+                  fy = {(t0 + dt.timedelta(days=365.25 * (f["y"] - 0.5))).year: f["f"] for f in fwd}
+                  common = [y for y in path if y in fy]
+                  basis = sum(path[y] - fy[y] for y in common) / len(common) if common else -0.1
+                  for y, v in fy.items():
+                      if y not in path: path[y] = v + basis
+              sofr_path = [{"y": y, "r": round(r, 3)} for y, r in sorted(path.items()) if y >= TODAY.year][:12]
+
+              if not series and not par: sys.exit("no curves loaded: " + "; ".join(errors))
+              asof = max(asofs) if asofs else (ud or TODAY.isoformat())
+              snap = {k: s["m12"] for k, s in series.items() if "m12" in s}
+              json.dump({"m12": snap}, open(f"data/curves_hist/{asof}.json", "w"))
+              prior = {}
+              for key, back in (("d7", 7), ("d30", 30)):
+                  for slack in range(0, 5):
+                      fp = f"data/curves_hist/{(dt.date.fromisoformat(asof) - dt.timedelta(days=back + slack)).isoformat()}.json"
+                      if os.path.exists(fp): prior[key] = json.load(open(fp)); break
+              for fn in os.listdir("data/curves_hist"):
+                  try:
+                      if (TODAY - dt.date.fromisoformat(fn[:10])).days > 45: os.remove(os.path.join("data/curves_hist", fn))
+                  except ValueError: pass
+              J = {"asOf": asof, "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat()[:19] + "Z", "series": series, "sofrPath": sofr_path,
+                   "ust": {"d": ud, "par": [{"t": p["t"], "y": p["y"]} for p in par], "fwd1y": fwd} if par else None,
+                   "spot": spot, "prior": prior, "errors": errors}
+              json.dump(J, open("data/curves.json", "w"), separators=(",", ":"))
+              print(f"settlements {asof}: {', '.join('%s (%d)' % (k, len(s['points'])) for k, s in series.items())}; Treasury {ud}; errors: {errors or 'none'}")
+
+          if __name__ == "__main__":
+              main()
+
+          PY
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then echo "No changes"; exit 0; fi
+          git commit -m "Forward curves: $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done
+          exit 1
