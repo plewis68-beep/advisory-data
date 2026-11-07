@@ -40,7 +40,7 @@ jobs:
           MON = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
           errors = []
 
-          def http(url, tries=3, timeout=45):
+          def http(url, tries=2, timeout=30):
               for i in range(tries):
                   try:
                       with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
@@ -67,16 +67,20 @@ jobs:
           # ---------- CME settlements ----------
           CME_ID = {"CL": 425, "BZ": 424, "NG": 444, "SR3": 8462, "ZQ": 305}
 
+          DEAD = set()  # sources that refused or timed out this run: skip them for the rest of the run
+
           def cme(code):
               """{(year, month): settle} from the latest trade date CME publishes."""
+              if "cme" in DEAD: return {}, None
+              tried = 0
               for back in range(0, 7):
                   d = TODAY - dt.timedelta(days=back)
                   if d.weekday() >= 5: continue
                   url = f"https://www.cmegroup.com/CmeWS/mvc/Settlements/Futures/Settlements/{CME_ID[code]}/FUT?strategy=DEFAULT&tradeDate={d.strftime('%m/%d/%Y')}&pageSize=500&isProtected"
                   try:
-                      J = json.loads(http(url, tries=2))
+                      J = json.loads(http(url, tries=1, timeout=20))
                   except Exception as e:
-                      last = e; continue
+                      DEAD.add("cme"); errors.append(f"CME settlements unavailable ({type(e).__name__}); used Yahoo Finance"); return {}, None
                   out = {}
                   for s in J.get("settlements") or []:
                       mm = re.match(r"([A-Z]{3})\s+(\d{2})", s.get("month") or "")
@@ -84,6 +88,8 @@ jobs:
                       if not mm or v is None or mm.group(1) not in MON: continue
                       out[(2000 + int(mm.group(2)), MON.index(mm.group(1)) + 1)] = v
                   if len(out) >= 3: return out, d.isoformat()
+                  tried += 1
+                  if tried >= 3: break
               return {}, None
 
           # ---------- Yahoo fallback ----------
@@ -91,21 +97,24 @@ jobs:
 
           def yahoo(code, ym_list):
               out, asof, miss = {}, None, 0
+              if "yahoo" in DEAD: return out, asof
               for y, m in ym_list:
                   sym = f"{code}{MC[m - 1]}{str(y)[2:]}.{YSUF[code]}"
                   try:
-                      J = json.loads(http(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5d&interval=1d", tries=2))
+                      J = json.loads(http(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5d&interval=1d", tries=1, timeout=15))
                       r = J["chart"]["result"][0]; meta = r["meta"]
                       closes = [c for c in (r.get("indicators", {}).get("quote", [{}])[0].get("close") or []) if c]
                       v = closes[-1] if closes else meta.get("regularMarketPrice")
                       if v:
                           out[(y, m)] = float(v); miss = 0
                           ts = (r.get("timestamp") or [meta.get("regularMarketTime")])[-1]
-                          if ts: asof = max(asof or "", dt.datetime.utcfromtimestamp(ts).date().isoformat())
+                          if ts: asof = max(asof or "", dt.datetime.fromtimestamp(ts, dt.timezone.utc).date().isoformat())
                       else: miss += 1
                   except Exception:
                       miss += 1
-                  if miss >= 6 and out: break
+                  if not out and miss >= 4:
+                      DEAD.add("yahoo"); errors.append("Yahoo Finance unavailable from GitHub's servers"); break
+                  if miss >= 6: break
                   time.sleep(0.15)
               return out, asof
 
@@ -233,7 +242,6 @@ jobs:
 
           if __name__ == "__main__":
               main()
-
           PY
 
       - name: Commit and push
