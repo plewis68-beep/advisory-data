@@ -1,8 +1,9 @@
-name: Prediction markets snapshot
+name: Forward curves
 
 on:
   schedule:
-    - cron: "5 */2 * * *"
+    - cron: "40 23 * * 1-5"
+    - cron: "40 11 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -23,177 +24,251 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install yfinance
+        run: pip install -q yfinance
+
       - name: Build data
         run: |
           python3 - <<'PY'
           #!/usr/bin/env python3
-          """Prediction-market snapshot for the Advisory Console -> data/predictions.json
-          Public, no-key APIs: Polymarket (gamma-api.polymarket.com) and Kalshi (api.elections.kalshi.com).
-          Columns: id, src, title, out, p, d1, d7, d30, vol, v24, end, url, th, tags.
-          Daily history (data/pm_hist/<date>.json) fills 7- and 30-day changes where a source doesn't give them."""
-          import json, os, re, sys, time, datetime as dt, urllib.request, urllib.parse
+          """Forward curves for the Advisory Console -> data/curves.json
+          Futures settlements: CME Group public settlements (fallback: Yahoo Finance contract quotes) for WTI (CL), Brent (BZ),
+          Henry Hub (NG), 3-month SOFR (SR3) and 30-day Fed funds (ZQ). Spot: FRED. Treasury par curve: U.S. Treasury.
+          Keeps a small daily history (data/curves_hist/) for 1-week and 1-month changes."""
+          import json, os, re, sys, time, math, csv, io, datetime as dt, urllib.request
 
-          UA = {"User-Agent": "advisory-data-feed/1.0", "Accept": "application/json"}
-          NOW = dt.datetime.now(dt.timezone.utc)
-          TODAY = NOW.date()
-          MAX_ROWS = 6000
-          errors, counts = [], {}
+          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "Accept": "application/json,text/csv,*/*"}
+          TODAY = dt.date.today()
+          MC = "FGHJKMNQUVXZ"
+          MON = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+          errors = []
 
-          def get(url, tries=3):
+          def http(url, tries=2, timeout=30):
               for i in range(tries):
                   try:
-                      with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
-                          return json.loads(r.read())
-                  except Exception as e:
+                      with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+                          return r.read()
+                  except Exception:
                       if i == tries - 1: raise
-                      time.sleep(2 + 3 * i)
+                      time.sleep(2 + 2 * i)
 
-          def f(x):
+          def fnum(x):
               try:
-                  v = float(x); return v if v == v else None
+                  v = float(str(x).replace(",", "").replace("'", "").strip().rstrip("ABab"))
+                  return v if math.isfinite(v) else None
               except Exception:
                   return None
 
-          def jl(x):
-              if isinstance(x, list): return x
-              try: return json.loads(x or "[]")
-              except Exception: return []
+          def months_ahead(n, start=None):
+              d = start or TODAY.replace(day=1)
+              out = []
+              for i in range(n):
+                  y, m = d.year + (d.month - 1 + i) // 12, (d.month - 1 + i) % 12 + 1
+                  out.append((y, m))
+              return out
 
-          THEMES = [
-              ("rates", r"\bfed\b|fomc|interest rate|rate cut|rate hike|powell|treasury yield|10-year|basis points|\bbps\b|federal funds"),
-              ("inflation", r"inflation|\bcpi\b|\bpce\b|consumer price"),
-              ("growth", r"recession|\bgdp\b|unemployment|jobless|payroll|jobs report|nonfarm|economy"),
-              ("energy", r"\boil\b|crude|\bwti\b|brent|natural gas|gasoline|opec|\blng\b|electricity|power price"),
-              ("commodities", r"gold|silver|copper|wheat|corn|soybean|commodit"),
-              ("policy", r"tariff|congress|senate bill|supreme court|regulat|\bsec\b|antitrust|executive order|shutdown|debt ceiling|legislation|\bftc\b|\bdoj\b|tax"),
-              ("elections", r"election|primary|nominee|electoral|governor|mayor|poll|vote|ballot|presiden"),
-              ("geopolitics", r"war\b|ceasefire|ukraine|russia|china|taiwan|israel|iran|gaza|nato|sanction|invade|military|missile"),
-              ("tech_ai", r"\bai\b|openai|anthropic|nvidia|\bgpt|artificial intelligence|chip|semiconductor|apple|google|microsoft|tesla|spacex"),
-              ("crypto", r"bitcoin|\bbtc\b|ethereum|\beth\b|crypto|solana|stablecoin|\bxrp\b"),
-              ("markets", r"s&p|nasdaq|dow\b|stock market|\bipo\b|market cap|\bvix\b|shares|stock price"),
-              ("companies", r"acquire|acquisition|merger|takeover|\bceo\b|bankrupt|earnings|layoff"),
-              ("climate", r"hurricane|temperature|weather|climate|snow|rain|heat|storm|tornado|wildfire"),
-          ]
-          SKIP = r"\b(nfl|nba|mlb|nhl|ufc|soccer|premier league|champions league|tennis|golf|f1\b|formula 1|super bowl|world series|stanley cup|match|game \d|vs\.?|touchdown|esports|oscars|grammy|emmy|box office|album|song|spotify|tweet|youtube|mrbeast|taylor swift)\b"
+          # ---------- CME settlements ----------
+          CME_ID = {"CL": 425, "BZ": 424, "NG": 444, "SR3": 8462, "ZQ": 305}
 
-          def themes(text, tags=()):
-              s = (text + " " + " ".join(tags)).lower()
-              th = [k for k, rx in THEMES if re.search(rx, s)]
-              return th[:3] or ["other"]
+          DEAD = set()  # sources that refused or timed out this run: skip them for the rest of the run
 
-          def day(s):
-              return str(s)[:10] if s else None
+          def cme(code):
+              """{(year, month): settle} from the latest trade date CME publishes."""
+              if "cme" in DEAD: return {}, None
+              tried = 0
+              for back in range(0, 7):
+                  d = TODAY - dt.timedelta(days=back)
+                  if d.weekday() >= 5: continue
+                  url = f"https://www.cmegroup.com/CmeWS/mvc/Settlements/Futures/Settlements/{CME_ID[code]}/FUT?strategy=DEFAULT&tradeDate={d.strftime('%m/%d/%Y')}&pageSize=500&isProtected"
+                  try:
+                      J = json.loads(http(url, tries=1, timeout=20))
+                  except Exception as e:
+                      DEAD.add("cme"); errors.append(f"CME settlements unavailable ({type(e).__name__}); used Yahoo Finance"); return {}, None
+                  out = {}
+                  for s in J.get("settlements") or []:
+                      mm = re.match(r"([A-Z]{3})\s+(\d{2})", s.get("month") or "")
+                      v = fnum(s.get("settle"))
+                      if not mm or v is None or mm.group(1) not in MON: continue
+                      out[(2000 + int(mm.group(2)), MON.index(mm.group(1)) + 1)] = v
+                  if len(out) >= 3: return out, d.isoformat()
+                  tried += 1
+                  if tried >= 3: break
+              return {}, None
 
-          # ---------------- Polymarket ----------------
-          def polymarket():
-              rows, off = [], 0
-              while off < 3000:
-                  q = urllib.parse.urlencode({"active": "true", "closed": "false", "archived": "false", "limit": 100, "offset": off, "order": "volume24hr", "ascending": "false"})
-                  evs = get(f"https://gamma-api.polymarket.com/events?{q}")
-                  if not evs: break
-                  for ev in evs:
-                      tags = [t.get("label") or t.get("slug") or "" for t in (ev.get("tags") or []) if isinstance(t, dict)]
-                      etitle = ev.get("title") or ""
-                      if re.search(SKIP, (etitle + " " + " ".join(tags)).lower()): continue
-                      mk = [m for m in (ev.get("markets") or []) if m.get("active", True) and not m.get("closed")]
-                      multi = len(mk) > 1
-                      for m in mk:
-                          outs, prices = jl(m.get("outcomes")), [f(x) for x in jl(m.get("outcomePrices"))]
-                          if not prices or prices[0] is None: continue
-                          if outs and len(outs) == 2 and str(outs[0]).lower() == "yes":
-                              p, out = prices[0], (m.get("groupItemTitle") or "") if multi else ""
-                          elif outs and len(outs) == 2:
-                              p, out = prices[0], str(outs[0])
-                          else:
-                              p, out = prices[0], m.get("groupItemTitle") or ""
-                          title = etitle if multi else (m.get("question") or etitle)
-                          rows.append({
-                              "id": "pm:" + str(m.get("id")), "src": "Polymarket", "title": title[:200], "out": (out or "")[:120], "p": round(p, 4),
-                              "d1": f(m.get("oneDayPriceChange")), "d7": f(m.get("oneWeekPriceChange")), "d30": f(m.get("oneMonthPriceChange")),
-                              "vol": f(m.get("volumeNum") or m.get("volume")), "v24": f(m.get("volume24hr")),
-                              "end": day(m.get("endDate") or ev.get("endDate")), "url": f"https://polymarket.com/event/{ev.get('slug')}",
-                              "th": themes(title + " " + (out or ""), tags), "tags": tags[:6]})
-                  off += 100
-                  time.sleep(0.3)
-              return rows
+          # ---------- Yahoo fallback ----------
+          YSUF = {"CL": "NYM", "BZ": "NYM", "NG": "NYM", "SR3": "CME", "ZQ": "CBT"}
 
-          # ---------------- Kalshi ----------------
-          def cents(m, k):
-              v = f(m.get(k + "_dollars"))
-              if v is not None: return v
-              v = f(m.get(k))
-              return None if v is None else v / 100.0
+          def yahoo(code, ym_list):
+              """Last close per contract via the yfinance library (handles Yahoo's cookie/crumb checks); urllib as a fallback."""
+              syms = {f"{code}{MC[m - 1]}{str(y)[2:]}.{YSUF[code]}": (y, m) for y, m in ym_list}
+              out, asof = {}, None
+              try:
+                  import yfinance as yf
+                  df = yf.download(list(syms), period="10d", interval="1d", progress=False, auto_adjust=False, threads=True)
+                  close = df["Close"] if "Close" in df.columns.get_level_values(0) else df
+                  if not hasattr(close, "columns"): close = close.to_frame(list(syms)[0])
+                  last = {}
+                  for sym in close.columns:
+                      col = close[sym].dropna()
+                      if len(col) and sym in syms:
+                          out[syms[sym]] = float(col.iloc[-1]); last[syms[sym]] = col.index[-1].date()
+                  if out:
+                      newest = max(last.values()); asof = newest.isoformat()
+                      out = {k: v for k, v in out.items() if (newest - last[k]).days <= 4}  # drop expired contracts with stale prices
+                      return out, asof
+              except Exception as e:
+                  errors.append(f"yfinance {code}: {type(e).__name__} {str(e)[:60]}")
+              if "yahoo" in DEAD: return out, asof
+              miss = 0
+              for sym, (y, m) in syms.items():
+                  try:
+                      J = json.loads(http(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=5d&interval=1d", tries=1, timeout=15))
+                      r = J["chart"]["result"][0]; meta = r["meta"]
+                      closes = [c for c in (r.get("indicators", {}).get("quote", [{}])[0].get("close") or []) if c]
+                      v = closes[-1] if closes else meta.get("regularMarketPrice")
+                      if v:
+                          out[(y, m)] = float(v); miss = 0
+                          ts = (r.get("timestamp") or [meta.get("regularMarketTime")])[-1]
+                          if ts: asof = max(asof or "", dt.datetime.fromtimestamp(ts, dt.timezone.utc).date().isoformat())
+                      else: miss += 1
+                  except Exception:
+                      miss += 1
+                  if not out and miss >= 4:
+                      DEAD.add("yahoo"); errors.append("Yahoo Finance unavailable from GitHub's servers"); break
+                  if miss >= 6: break
+                  time.sleep(0.15)
+              return out, asof
 
-          def kalshi():
-              rows, cur, n = [], "", 0
-              while n < 40:
-                  q = {"status": "open", "with_nested_markets": "true", "limit": 200}
-                  if cur: q["cursor"] = cur
-                  J = get("https://api.elections.kalshi.com/trade-api/v2/events?" + urllib.parse.urlencode(q))
-                  for ev in J.get("events") or []:
-                      cat = ev.get("category") or ""
-                      etitle = ev.get("title") or ""
-                      if re.search(SKIP, (etitle + " " + cat).lower()) or cat.lower() in ("sports", "entertainment"): continue
-                      mk = [m for m in (ev.get("markets") or []) if (m.get("status") or "active") in ("active", "open")]
-                      multi = len(mk) > 1
-                      for m in mk:
-                          p = cents(m, "last_price")
-                          bid, ask = cents(m, "yes_bid"), cents(m, "yes_ask")
-                          if (p is None or p == 0) and bid is not None and ask is not None and ask > 0: p = (bid + ask) / 2
-                          if p is None: continue
-                          prev = cents(m, "previous_price")
-                          vol, v24 = f(m.get("volume_fp") or m.get("volume")), f(m.get("volume_24h_fp") or m.get("volume_24h"))
-                          if not vol and not v24: continue
-                          out = (m.get("yes_sub_title") or m.get("subtitle") or "") if multi else ""
-                          title = etitle if multi else (m.get("title") or etitle)
-                          st = (ev.get("series_ticker") or m.get("event_ticker") or "").lower()
-                          rows.append({
-                              "id": "ks:" + m.get("ticker", ""), "src": "Kalshi", "title": title[:200], "out": out[:120], "p": round(min(max(p, 0), 1), 4),
-                              "d1": round(p - prev, 4) if prev not in (None, 0) else None, "d7": None, "d30": None,
-                              "vol": vol, "v24": v24, "end": day(m.get("close_time") or m.get("expiration_time")),
-                              "url": f"https://kalshi.com/markets/{st}", "th": themes(title + " " + out + " " + cat, [cat]), "tags": [cat] if cat else []})
-                  cur = J.get("cursor") or ""; n += 1
-                  if not cur: break
-                  time.sleep(0.4)
-              return rows
+          def strip(code, n, quarterly=False):
+              ym = [(y, m) for y, m in months_ahead(n) if not quarterly or m in (3, 6, 9, 12)]
+              data, asof = cme(code)
+              src = "CME Group settlements"
+              if len(data) < 3:
+                  data, asof = yahoo(code, ym)
+                  src = "CME futures via Yahoo Finance (last price)"
+              data = {k: v for k, v in data.items() if (k[0], k[1]) >= (TODAY.year, TODAY.month)}
+              if quarterly: data = {k: v for k, v in data.items() if k[1] in (3, 6, 9, 12)}
+              return dict(sorted(data.items())[:n]), asof, src
+
+          # ---------- FRED / Treasury ----------
+          def fred(sid):
+              try:
+                  txt = http(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}", tries=2, timeout=90).decode()
+                  rows = [r for r in csv.reader(io.StringIO(txt))][1:]
+                  for d, v in reversed(rows):
+                      if fnum(v) is not None: return {"v": round(float(v), 4), "d": d}
+              except Exception as e:
+                  if sid == "SOFR":
+                      try:
+                          r = json.loads(http("https://markets.newyorkfed.org/api/rates/secured/sofr/last/1.json", tries=2))["refRates"][0]
+                          return {"v": float(r["percentRate"]), "d": r["effectiveDate"]}
+                      except Exception:
+                          pass
+                  errors.append(f"FRED {sid}: {type(e).__name__}")
+              return None
+
+          TEN = [("1 Mo", 1 / 12), ("2 Mo", 2 / 12), ("3 Mo", .25), ("4 Mo", 1 / 3), ("6 Mo", .5), ("1 Yr", 1), ("2 Yr", 2), ("3 Yr", 3), ("5 Yr", 5), ("7 Yr", 7), ("10 Yr", 10), ("20 Yr", 20), ("30 Yr", 30)]
+
+          def treasury():
+              for yr in (TODAY.year, TODAY.year - 1):
+                  try:
+                      url = f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{yr}/all?type=daily_treasury_yield_curve&field_tdr_date_value={yr}&page&_format=csv"
+                      rows = list(csv.DictReader(io.StringIO(http(url).decode("utf-8-sig"))))
+                      if not rows: continue
+                      rows.sort(key=lambda r: dt.datetime.strptime(r["Date"], "%m/%d/%Y"))
+                      r = rows[-1]
+                      par = [{"t": t.replace("Mo", "mo").replace("Yr", "yr"), "y": fnum(r[t]), "n": n} for t, n in TEN if fnum(r.get(t)) is not None]
+                      return dt.datetime.strptime(r["Date"], "%m/%d/%Y").date().isoformat(), par
+                  except Exception as e:
+                      err = e
+              errors.append(f"Treasury curve: {type(err).__name__}")
+              return None, []
+
+          def ust_forwards(par):
+              """Bootstrap annual-coupon par yields to zero rates, then 1-year forwards for years 1..10."""
+              if len(par) < 4: return []
+              xs, ys = [p["n"] for p in par], [p["y"] / 100 for p in par]
+              def interp(t):
+                  if t <= xs[0]: return ys[0]
+                  for i in range(1, len(xs)):
+                      if t <= xs[i]: return ys[i - 1] + (ys[i] - ys[i - 1]) * (t - xs[i - 1]) / (xs[i] - xs[i - 1])
+                  return ys[-1]
+              dfs = []
+              for n in range(1, 11):
+                  c = interp(n)
+                  df = (1 - c * sum(dfs)) / (1 + c)
+                  dfs.append(df)
+              fw, prev = [], 1.0
+              for n, df in enumerate(dfs, 1):
+                  fw.append({"y": n, "f": round((prev / df - 1) * 100, 3)}); prev = df
+              return fw
 
           def main():
-              rows = []
-              for name, fn in (("Polymarket", polymarket), ("Kalshi", kalshi)):
+              os.makedirs("data/curves_hist", exist_ok=True)
+              series, asofs = {}, []
+              for k, code, n, label, unit in (("wti", "CL", 84, "WTI crude (NYMEX CL)", "$/bbl"), ("brent", "BZ", 60, "Brent crude (NYMEX BZ)", "$/bbl"), ("hh", "NG", 84, "Henry Hub natural gas (NYMEX NG)", "$/MMBtu")):
                   try:
-                      r = fn(); rows += r; counts[name] = len(r); print(f"{name}: {len(r)} markets", flush=True)
+                      d, asof, src = strip(code, n)
+                      if len(d) < 3: raise RuntimeError("no contracts found")
+                      pts = [{"m": f"{y}-{m:02d}", "p": round(v, 3), "t": f"{code}{MC[m - 1]}{str(y)[2:]}"} for (y, m), v in d.items()]
+                      series[k] = {"label": label, "unit": unit, "src": src, "points": pts, "m12": round(sum(p["p"] for p in pts[:12]) / min(12, len(pts)), 3)}
+                      if asof: asofs.append(asof)
                   except Exception as e:
-                      errors.append(f"{name}: {type(e).__name__} {str(e)[:120]}"); counts[name] = 0
-              if not rows: sys.exit("no markets loaded: " + "; ".join(errors))
-              os.makedirs("data/pm_hist", exist_ok=True)
-              # 7/30-day changes from our own daily history when the source doesn't provide them
-              hist = {}
-              for back in (1, 7, 30):
-                  for slack in range(0, 4):
-                      fp = f"data/pm_hist/{(TODAY - dt.timedelta(days=back + slack)).isoformat()}.json"
-                      if os.path.exists(fp): hist[back] = json.load(open(fp)); break
-              for r in rows:
-                  for back, k in ((1, "d1"), (7, "d7"), (30, "d30")):
-                      if r[k] is None and back in hist and r["id"] in hist[back]: r[k] = round(r["p"] - hist[back][r["id"]], 4)
-              json.dump({r["id"]: r["p"] for r in rows}, open(f"data/pm_hist/{TODAY.isoformat()}.json", "w"), separators=(",", ":"))
-              for fn in os.listdir("data/pm_hist"):
+                      errors.append(f"{label}: {type(e).__name__} {str(e)[:80]}")
+              try:
+                  d, asof, src = strip("SR3", 66, quarterly=True)
+                  if d:
+                      series["sofr"] = {"label": "3-month SOFR futures (CME SR3)", "unit": "%", "src": src,
+                                        "points": [{"t": f"SR3{MC[m - 1]}{str(y)[2:]}", "m": f"{y}-{m:02d}", "p": round(100 - v, 4)} for (y, m), v in d.items()]}
+                      if asof: asofs.append(asof)
+              except Exception as e:
+                  errors.append(f"SOFR futures: {type(e).__name__}")
+              try:
+                  d, asof, src = strip("ZQ", 13)
+                  if d: series["ff"] = {"label": "30-day Fed funds futures (CBOT ZQ)", "unit": "%", "src": src, "points": [{"m": f"{y}-{m:02d}", "p": round(100 - v, 4)} for (y, m), v in d.items()]}
+              except Exception as e:
+                  errors.append(f"Fed funds futures: {type(e).__name__}")
+
+              ud, par = treasury()
+              fwd = ust_forwards(par)
+              spot = {k: v for k, v in (("wti", fred("DCOILWTICO")), ("brent", fred("DCOILBRENTEU")), ("hh", fred("DHHNGSP")), ("sofr", fred("SOFR"))) if v}
+
+              # SOFR path by calendar year: futures where available, then Treasury forwards less the average futures-vs-Treasury basis
+              path = {}
+              if "sofr" in series:
+                  by = {}
+                  for p in series["sofr"]["points"]: by.setdefault(int(p["m"][:4]), []).append(p["p"])
+                  path = {y: sum(v) / len(v) for y, v in by.items()}
+              if fwd and ud:
+                  t0 = dt.date.fromisoformat(ud)
+                  fy = {(t0 + dt.timedelta(days=365.25 * (f["y"] - 0.5))).year: f["f"] for f in fwd}
+                  common = [y for y in path if y in fy]
+                  basis = sum(path[y] - fy[y] for y in common) / len(common) if common else -0.1
+                  for y, v in fy.items():
+                      if y not in path: path[y] = v + basis
+              sofr_path = [{"y": y, "r": round(r, 3)} for y, r in sorted(path.items()) if y >= TODAY.year][:12]
+
+              if not series and not par: sys.exit("no curves loaded: " + "; ".join(errors))
+              asof = max(asofs) if asofs else (ud or TODAY.isoformat())
+              snap = {k: s["m12"] for k, s in series.items() if "m12" in s}
+              json.dump({"m12": snap}, open(f"data/curves_hist/{asof}.json", "w"))
+              prior = {}
+              for key, back in (("d7", 7), ("d30", 30)):
+                  for slack in range(0, 5):
+                      fp = f"data/curves_hist/{(dt.date.fromisoformat(asof) - dt.timedelta(days=back + slack)).isoformat()}.json"
+                      if os.path.exists(fp): prior[key] = json.load(open(fp)); break
+              for fn in os.listdir("data/curves_hist"):
                   try:
-                      if (TODAY - dt.date.fromisoformat(fn[:10])).days > 40: os.remove(os.path.join("data/pm_hist", fn))
+                      if (TODAY - dt.date.fromisoformat(fn[:10])).days > 45: os.remove(os.path.join("data/curves_hist", fn))
                   except ValueError: pass
-              rows.sort(key=lambda r: -((r["v24"] or 0) * 3 + (r["vol"] or 0) / 30))
-              rows = rows[:MAX_ROWS]
-              cols = ["id", "src", "title", "out", "p", "d1", "d7", "d30", "vol", "v24", "end", "url", "th", "tags"]
-              for r in rows:
-                  for k in ("vol", "v24"):
-                      if r[k] is not None: r[k] = round(r[k])
-              J = {"asof": NOW.isoformat()[:19] + "Z", "cols": cols, "rows": [[r[c] for c in cols] for r in rows], "counts": counts, "errors": errors,
-                   "source": "Polymarket and Kalshi public APIs"}
-              json.dump(J, open("data/predictions.json", "w"), separators=(",", ":"))
-              print(f"wrote {len(rows)} markets; errors: {errors or 'none'}")
+              J = {"asOf": asof, "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat()[:19] + "Z", "series": series, "sofrPath": sofr_path,
+                   "ust": {"d": ud, "par": [{"t": p["t"], "y": p["y"]} for p in par], "fwd1y": fwd} if par else None,
+                   "spot": spot, "prior": prior, "errors": errors}
+              json.dump(J, open("data/curves.json", "w"), separators=(",", ":"))
+              print(f"settlements {asof}: {', '.join('%s (%d)' % (k, len(s['points'])) for k, s in series.items())}; Treasury {ud}; errors: {errors or 'none'}")
 
           if __name__ == "__main__":
               main()
-
           PY
 
       - name: Commit and push
@@ -202,6 +277,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data
           if git diff --cached --quiet; then echo "No changes"; exit 0; fi
-          git commit -m "Prediction markets snapshot: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -m "Forward curves: $(date -u +%Y-%m-%dT%H:%MZ)"
           for i in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done
           exit 1
